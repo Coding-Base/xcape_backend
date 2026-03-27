@@ -16,6 +16,8 @@ from api.serializers import (
     UserActivityLogSerializer
 )
 
+from simulator.forecast_generator import ForecastGenerator
+
 User = get_user_model()
 
 
@@ -398,6 +400,105 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             'message': 'Simulation marked as failed',
             'simulation': SimulationRunDetailSerializer(simulation).data
         }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
+    def generate_forecast(self, request, pk=None):
+        """Generate a prior or posterior forecast for a simulation"""
+        simulation = self.get_object()
+        forecast_type = request.data.get('forecast_type', 'prior')
+        forecast_period_days = int(request.data.get('forecast_period_days', 365))
+        # Optional: accept ensemble parameters from client
+        ensemble_params = request.data.get('ensemble_params')
+
+        fg = ForecastGenerator()
+
+        # Simple forward model using synthetic production data (fallback)
+        def forward_model_fn(params):
+            return {'production_data': fg._get_synthetic_production_data(forecast_period_days)}
+
+        # If no ensemble provided, generate a small ensemble from simulation parameters
+        if not ensemble_params:
+            base_params = {
+                'initial_pressure': simulation.initial_pressure,
+                'porosity': simulation.porosity,
+                'permeability': simulation.permeability,
+                'water_saturation': simulation.water_saturation,
+            }
+            # create simple ensemble with small perturbations
+            ensemble_params = []
+            for i in range(10):
+                perturbed = {k: float(v) * (1 + 0.02 * (i - 5)) for k, v in base_params.items()}
+                ensemble_params.append(perturbed)
+
+        result = fg.generate_forecast(
+            str(simulation.id),
+            ensemble_params,
+            forward_model_fn,
+            forecast_type=forecast_type,
+            forecast_period_days=forecast_period_days
+        )
+
+        if result.get('status') != 'completed':
+            return Response({'error': result.get('error', 'Failed to generate forecast')},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        forecast_payload = result['forecast']
+
+        # Persist Forecast model
+        forecast_obj = Forecast.objects.create(
+            simulation=simulation,
+            user=request.user,
+            name=f"{simulation.name} - {forecast_type} forecast",
+            description=request.data.get('description', ''),
+            forecast_type=forecast_type,
+            forecast_date=request.data.get('forecast_date') or None,
+            forecast_period_days=forecast_period_days,
+            predicted_parameters=forecast_payload.get('predictions', {}),
+            predictions=forecast_payload.get('predictions', {}),
+            uncertainty_bounds=forecast_payload.get('uncertainty', {})
+        )
+
+        # Update user statistics
+        stats, _ = SimulationStatistics.objects.get_or_create(user=request.user)
+        stats.total_forecasts_generated += 1
+        stats.save()
+
+        serializer = ForecastSerializer(forecast_obj, context={'request': request})
+        return Response({'message': 'Forecast generated', 'forecast': serializer.data},
+                        status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
+    def compare_forecasts(self, request, pk=None):
+        """Generate prior/posterior comparison using provided ensembles or EnKF results"""
+        simulation = self.get_object()
+        prior_ensemble = request.data.get('prior_ensemble')
+        posterior_ensemble = request.data.get('posterior_ensemble')
+        forecast_period_days = int(request.data.get('forecast_period_days', 365))
+
+        fg = ForecastGenerator()
+
+        def forward_model_fn(params):
+            return {'production_data': fg._get_synthetic_production_data(forecast_period_days)}
+
+        if not prior_ensemble or not posterior_ensemble:
+            # Attempt to use simulation.results_data to derive ensembles (if EnKF ran)
+            results = simulation.results_data or {}
+            prior_ensemble = prior_ensemble or results.get('prior_ensemble')
+            posterior_ensemble = posterior_ensemble or results.get('posterior_ensemble')
+
+        if not prior_ensemble or not posterior_ensemble:
+            return Response({'error': 'Both prior_ensemble and posterior_ensemble are required'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        comparison = fg.generate_prior_posterior_comparison(
+            str(simulation.id), prior_ensemble, posterior_ensemble, forward_model_fn, forecast_period_days
+        )
+
+        if comparison.get('status') != 'completed':
+            return Response({'error': comparison.get('error', 'Failed to generate comparison')},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response({'message': 'Comparison generated', 'comparison': comparison}, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['get'])
     def recent(self, request):
@@ -467,3 +568,76 @@ class ForecastViewSet(viewsets.ModelViewSet):
         forecasts = request.user.forecasts.filter(simulation_id=simulation_id)
         serializer = self.get_serializer(forecasts, many=True)
         return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def parameter_histogram(self, request):
+        """Return histogram data for a parameter across an ensemble or forecasts"""
+        import numpy as np
+
+        simulation_id = request.query_params.get('simulation_id')
+        parameter = request.query_params.get('parameter')
+        bins = int(request.query_params.get('bins', 20))
+
+        if not simulation_id or not parameter:
+            return Response({'error': 'simulation_id and parameter are required'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # Try to collect parameter values from forecasts' predicted_parameters
+        forecasts = self.request.user.forecasts.filter(simulation_id=simulation_id)
+        values = []
+        for f in forecasts:
+            params = f.predicted_parameters or {}
+            if isinstance(params, dict) and parameter in params:
+                try:
+                    values.append(float(params[parameter]))
+                except Exception:
+                    continue
+
+        if not values:
+            return Response({'error': 'No parameter values found for histogram'},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        arr = np.array(values)
+        counts, edges = np.histogram(arr, bins=bins)
+        return Response({
+            'parameter': parameter,
+            'counts': counts.tolist(),
+            'bin_edges': edges.tolist(),
+            'n': int(arr.size)
+        })
+
+    @action(detail=False, methods=['get'])
+    def comparison_chart(self, request):
+        """Return series data (mean/p10/p50/p90) for prior vs posterior for a metric"""
+        simulation_id = request.query_params.get('simulation_id')
+        metric = request.query_params.get('metric', 'oil')
+
+        if not simulation_id:
+            return Response({'error': 'simulation_id required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Find latest prior and posterior forecasts
+        prior = self.request.user.forecasts.filter(simulation_id=simulation_id, forecast_type='prior').order_by('-generated_at').first()
+        posterior = self.request.user.forecasts.filter(simulation_id=simulation_id, forecast_type='posterior').order_by('-generated_at').first()
+
+        if not prior or not posterior:
+            return Response({'error': 'Both prior and posterior forecasts required'}, status=status.HTTP_404_NOT_FOUND)
+
+        def extract_series(forecast_obj, metric_key):
+            preds = forecast_obj.predictions or {}
+            metric_data = preds.get(metric_key, {})
+            return {
+                'mean': metric_data.get('mean', []),
+                'p10': metric_data.get('p10', []),
+                'p50': metric_data.get('p50', []),
+                'p90': metric_data.get('p90', []),
+            }
+
+        data = {
+            'simulation_id': simulation_id,
+            'metric': metric,
+            'prior': extract_series(prior, metric),
+            'posterior': extract_series(posterior, metric),
+            'time_axis': prior.predictions.get('time_axis') if prior.predictions else None
+        }
+
+        return Response(data)

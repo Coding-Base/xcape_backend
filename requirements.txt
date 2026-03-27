@@ -1,0 +1,32 @@
+# Core Django
+Django
+djangorestframework
+django-cors-headers
+
+# Database
+psycopg2-binary
+
+# Image handling
+Pillow
+
+# API utilities
+djangorestframework-simplejwt
+
+# Simulator algorithms
+numpy
+scipy
+
+# Environment variables
+python-dotenv
+
+# Development/Utilities
+requests
+
+# Production server
+gunicorn
+whitenoise
+
+# Linting/Formatting (optional for development)
+black
+flake8
+isort
