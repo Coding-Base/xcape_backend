@@ -42,6 +42,8 @@ class ForecastGenerator:
             Forecast with predictions and uncertainty bounds
         """
         logger.info(f"Generating {forecast_type} forecast for simulation {simulation_id}")
+        print(f"[FORECAST] === Generating {forecast_type} for SIM {simulation_id} ===", file=__import__('sys').stderr, flush=True)
+        print(f"[FORECAST] Ensemble size: {len(ensemble_params)}", file=__import__('sys').stderr, flush=True)
         
         if forecast_date is None:
             forecast_date = datetime.now().isoformat()
@@ -52,17 +54,27 @@ class ForecastGenerator:
             try:
                 result = forward_model_fn(params)
                 ensemble_results.append(result)
+                if i % 10 == 0 or i < 3 or i == len(ensemble_params) - 1:
+                    print(f"[FORECAST] Member {i}/{len(ensemble_params)}: OK", file=__import__('sys').stderr, flush=True)
             except Exception as e:
                 logger.warning(f"Forward model failed for ensemble member {i}: {e}")
+                print(f"[FORECAST] Member {i}/{len(ensemble_params)}: FAILED - {e}", file=__import__('sys').stderr, flush=True)
         
         if not ensemble_results:
             return {'status': 'failed', 'error': 'No successful forward model runs'}
         
+        print(f"[FORECAST] Completed {len(ensemble_results)} forward runs", file=__import__('sys').stderr, flush=True)
+        
         # Extract production data from each result
         ensemble_data = []
-        for result in ensemble_results:
+        for i, result in enumerate(ensemble_results):
             data = self._extract_production_data(result, forecast_period_days)
             ensemble_data.append(data)
+            if i < 3:
+                oil_sample = data.get('oil', [])
+                if oil_sample:
+                    print(f"[FORECAST] Member {i}: oil range=[{min(oil_sample):.0f}, {max(oil_sample):.0f}]", 
+                          file=__import__('sys').stderr, flush=True)
         
         # Calculate statistics
         forecast = self._calculate_forecast_statistics(
@@ -152,6 +164,33 @@ class ForecastGenerator:
     ) -> Dict:
         """Extract and structure production data from forward model result"""
         try:
+            # First, check for direct keys (oil, water, gas, pressure)
+            if all(key in result for key in ['oil', 'water', 'gas', 'pressure']):
+                # Convert to lists if needed
+                oil = result['oil']
+                water = result['water']
+                gas = result['gas']
+                pressure = result['pressure']
+                
+                # Convert numpy arrays to lists
+                if isinstance(oil, np.ndarray):
+                    oil = oil.tolist()
+                if isinstance(water, np.ndarray):
+                    water = water.tolist()
+                if isinstance(gas, np.ndarray):
+                    gas = gas.tolist()
+                if isinstance(pressure, np.ndarray):
+                    pressure = pressure.tolist()
+                
+                return {
+                    'days': list(range(len(oil))),
+                    'oil': oil,
+                    'water': water,
+                    'gas': gas,
+                    'pressure': pressure,
+                }
+            
+            # Then check for production_data sub-dict
             if 'production_data' in result:
                 prod_data = result['production_data']
                 
@@ -189,6 +228,19 @@ class ForecastGenerator:
         water_ensemble = np.array([d.get('water', []) for d in ensemble_data])
         gas_ensemble = np.array([d.get('gas', []) for d in ensemble_data])
         pressure_ensemble = np.array([d.get('pressure', []) for d in ensemble_data])
+        
+        print(f"[FORECAST] Ensemble arrays: oil_shape={oil_ensemble.shape}, "
+              f"water_shape={water_ensemble.shape}, gas_shape={gas_ensemble.shape}, "
+              f"pressure_shape={pressure_ensemble.shape}", file=__import__('sys').stderr, flush=True)
+        
+        if oil_ensemble.shape[0] > 0:
+            print(f"[FORECAST] Oil ensemble first 3 members (point 0): {oil_ensemble[:3, 0]}", 
+                  file=__import__('sys').stderr, flush=True)
+            oil_p10 = np.percentile(oil_ensemble, 10, axis=0)
+            oil_p50 = np.percentile(oil_ensemble, 50, axis=0)
+            oil_p90 = np.percentile(oil_ensemble, 90, axis=0)
+            print(f"[FORECAST] Oil percentiles (point 0): p10={oil_p10[0]:.1f}, p50={oil_p50[0]:.1f}, p90={oil_p90[0]:.1f}", 
+                  file=__import__('sys').stderr, flush=True)
         
         # Calculate statistics
         days = ensemble_data[0].get('days', [])

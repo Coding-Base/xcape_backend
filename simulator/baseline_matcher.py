@@ -26,7 +26,7 @@ class BaselineMatcher:
         observed_data: Dict,
         simulated_data: Dict,
         parameters: Dict,
-        parameter_bounds: Dict = None
+        parameter_bounds: Optional[Dict] = None
     ) -> Dict:
         """
         Perform manual baseline matching
@@ -88,7 +88,7 @@ class BaselineMatcher:
         observed_data: Dict,
         forward_model_fn,
         initial_params: Dict,
-        parameter_bounds: Dict = None,
+        parameter_bounds: Optional[Dict] = None,
         max_iterations: int = 100
     ) -> Dict:
         """

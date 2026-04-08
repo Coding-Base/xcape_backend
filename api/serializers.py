@@ -79,18 +79,29 @@ class UserActivityLogSerializer(serializers.ModelSerializer):
 
 class DatasetSerializer(serializers.ModelSerializer):
     file_url = serializers.SerializerMethodField()
+    file = serializers.FileField(write_only=True, required=True)
     
     class Meta:
         model = Dataset
-        fields = ['id', 'name', 'description', 'filename', 'file_size', 'uploaded_at',
+        fields = ['id', 'name', 'description', 'file', 'filename', 'file_size', 'uploaded_at',
                   'updated_at', 'file_url', 'production_data']
-        read_only_fields = ['id', 'uploaded_at', 'updated_at']
+        read_only_fields = ['id', 'filename', 'file_size', 'uploaded_at', 'updated_at']
     
     def get_file_url(self, obj):
         request = self.context.get('request')
         if obj.file and request:
             return request.build_absolute_uri(obj.file.url)
         return None
+    
+    def create(self, validated_data):
+        file = validated_data.pop('file')
+        dataset = Dataset.objects.create(
+            file=file,
+            filename=file.name,
+            file_size=file.size,
+            **validated_data
+        )
+        return dataset
 
 
 class SimulationRunListSerializer(serializers.ModelSerializer):
@@ -126,8 +137,9 @@ class SimulationRunDetailSerializer(serializers.ModelSerializer):
 class SimulationRunCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = SimulationRun
-        fields = ['name', 'description', 'matching_type', 'dataset',
-                  'initial_pressure', 'porosity', 'permeability', 'water_saturation']
+        fields = ['id', 'name', 'description', 'matching_type', 'dataset',
+                  'initial_pressure', 'porosity', 'permeability', 'water_saturation', 'created_at']
+        read_only_fields = ['id', 'created_at']
     
     def create(self, validated_data):
         validated_data['user'] = self.context['request'].user

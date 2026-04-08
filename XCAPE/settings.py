@@ -31,6 +31,7 @@ ALLOWED_HOSTS = ['*']
 # Application definition
 
 INSTALLED_APPS = [
+    'daphne',  # Add Daphne ASGI server for Channels support
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -39,6 +40,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     
     # Third-party apps
+    'channels',  # Add Channels for WebSocket support
     'rest_framework',
     'rest_framework.authtoken',
     'corsheaders',
@@ -78,7 +80,14 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = 'XCAPE.wsgi.application'
+ASGI_APPLICATION = 'XCAPE.asgi.application'
+
+# Channels configuration
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels.layers.InMemoryChannelLayer',
+    }
+}
 
 
 # Database

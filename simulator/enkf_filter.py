@@ -4,7 +4,7 @@ Advanced automated calibration using Ensemble Kalman Filter
 """
 
 import logging
-from typing import Dict, List, Tuple, Optional, Callable
+from typing import Dict, List, Tuple, Optional, Callable, Union
 import numpy as np
 from datetime import datetime
 from scipy import stats
@@ -31,9 +31,9 @@ class EnKFFilter:
         observed_data: Dict,
         forward_model_fn: Callable,
         initial_ensemble: np.ndarray,
-        measurement_error: Dict = None,
+        measurement_error: Optional[Dict] = None,
         num_iterations: int = 10,
-        progress_callback: Callable = None
+        progress_callback: Optional[Callable] = None
     ) -> Dict:
         """
         Run Ensemble Kalman Filter
@@ -149,11 +149,12 @@ class EnKFFilter:
         
         # Concatenate all observations into single vector
         obs_vec = np.concatenate([observations[k] for k in observations.keys()])
+        H_obs = len(obs_vec)  # Total number of observations
         
         # Build simulated observation matrix (H x N)
         H_matrix = []
         for sim_dict in simulated_data:
-            sim_vec = np.concatenate([sim_dict.get(k, np.zeros(1)) 
+            sim_vec = np.concatenate([sim_dict.get(k, np.zeros(len(observations[k]))) 
                                      for k in observations.keys()])
             H_matrix.append(sim_vec)
         H_matrix = np.array(H_matrix).T  # H x N
@@ -165,13 +166,19 @@ class EnKFFilter:
         Y_anom = H_matrix - h_mean  # H x N (observation space anomalies)
         X_anom = (ensemble - np.mean(ensemble, axis=0, keepdims=True)).T  # M x N (parameter space anomalies)
         
-        # Measurement error covariance matrix
-        R = np.diag([measurement_error.get(k, 0.1) ** 2 
-                     for k in observations.keys()])
+        # Measurement error covariance matrix - one error per observation (not per type)
+        # Create error array for each observation point
+        error_values = []
+        for k in observations.keys():
+            n_obs_type = len(observations[k])
+            error_std = measurement_error.get(k, 0.1)
+            error_values.extend([error_std] * n_obs_type)
+        
+        R = np.diag(np.array(error_values) ** 2)  # H x H covariance matrix
         
         # Kalman gain: K = X_anom * Y_anom.T * (Y_anom * Y_anom.T + R)^{-1}
         try:
-            denominator = Y_anom @ Y_anom.T + R * N
+            denominator = Y_anom @ Y_anom.T + R
             K_gain = (X_anom @ Y_anom.T) @ np.linalg.inv(denominator)
             
             # Update each ensemble member
@@ -230,15 +237,28 @@ class EnKFFilter:
     def _extract_observations(self, data: Dict) -> Dict:
         """Extract observations from data"""
         try:
-            if 'production_data' in data:
-                return data['production_data']
+            # Check if data already has oil/water/gas/pressure keys (format from run_enkf_with_forecasts)
+            if all(key in data for key in ['oil', 'water', 'gas', 'pressure']):
+                return {
+                    'oil': np.array(data['oil'], dtype=float),
+                    'water': np.array(data['water'], dtype=float),
+                    'gas': np.array(data['gas'], dtype=float),
+                    'pressure': np.array(data['pressure'], dtype=float)
+                }
             
-            # Fallback: create synthetic observations
-            return {
-                'oil': np.array([100] * 20),
-                'water': np.array([50] * 20),
-                'gas': np.array([500] * 20)
-            }
+            # Check if data has production_data sub-dict
+            if 'production_data' in data:
+                prod_data = data['production_data']
+                return {
+                    'oil': np.array(prod_data.get('oil', prod_data.get('Oil_bbl', [])), dtype=float),
+                    'water': np.array(prod_data.get('water', prod_data.get('Water_bbl', [])), dtype=float),
+                    'gas': np.array(prod_data.get('gas', prod_data.get('Gas_scf', [])), dtype=float),
+                    'pressure': np.array(prod_data.get('pressure', prod_data.get('Pressure_psi', [])), dtype=float)
+                }
+            
+            # Last resort fallback if data is completely empty
+            logger.warning("No observation data found in extract_observations. Using empty dict.")
+            return {}
         except Exception as e:
             logger.warning(f"Could not extract observations: {e}")
             return {}
@@ -251,7 +271,7 @@ class EnKFFilter:
     def initialize_ensemble(
         self,
         mean_params: Dict,
-        std_params: Dict = None
+        std_params: Optional[Dict] = None
     ) -> np.ndarray:
         """
         Initialize ensemble from mean and std of parameters

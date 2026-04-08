@@ -40,7 +40,7 @@ class OPMFlowWrapper:
     def run_simulation(
         self,
         deck_file: str,
-        parameters: Dict = None,
+        parameters: Optional[Dict] = None,
         timeout: int = 3600
     ) -> Tuple[bool, Dict]:
         """
@@ -85,7 +85,7 @@ class OPMFlowWrapper:
             logger.error(f"Error running OPM Flow simulation: {e}")
             return False, {'error': str(e)}
     
-    def _get_mock_results(self, parameters: Dict = None) -> Tuple[bool, Dict]:
+    def _get_mock_results(self, parameters: Optional[Dict] = None) -> Tuple[bool, Dict]:
         """Get mock simulation results for testing"""
         import numpy as np
         from datetime import datetime
