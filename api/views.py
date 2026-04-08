@@ -6,6 +6,8 @@ from django.contrib.auth import authenticate, get_user_model
 from django.db.models import Q
 from django.utils import timezone
 from datetime import timedelta
+import logging
+import numpy as np
 
 from users.models import CustomUser, UserActivityLog
 from simulations.models import Dataset, SimulationRun, Forecast, SimulationStatistics
@@ -17,8 +19,12 @@ from api.serializers import (
 )
 
 from simulator.forecast_generator import ForecastGenerator
+from simulator.enkf_filter import EnKFFilter
+from simulator.engine import SimulationEngine
 
 User = get_user_model()
+
+logger = logging.getLogger(__name__)
 
 
 class IsAuthenticated(permissions.BasePermission):
@@ -499,6 +505,147 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         return Response({'message': 'Comparison generated', 'comparison': comparison}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
+    def run_enkf_with_forecasts(self, request, pk=None):
+        """Run complete EnKF pipeline with prior and posterior forecasts"""
+        simulation = self.get_object()
+        
+        # Get parameters from simulation or request
+        ensemble_size = int(request.data.get('ensemble_size', 100))
+        num_iterations = int(request.data.get('num_iterations', 10))
+        forecast_period_days = int(request.data.get('forecast_period_days', 365))
+        
+        try:
+            # Initialize EnKF
+            enkf = EnKFFilter(ensemble_size=ensemble_size)
+            
+            # Create initial ensemble from simulation parameters
+            mean_params = {
+                'initial_pressure': simulation.initial_pressure,
+                'porosity': simulation.porosity,
+                'permeability': simulation.permeability,
+                'water_saturation': simulation.water_saturation,
+            }
+            
+            prior_ensemble = enkf.initialize_ensemble(mean_params)
+            
+            # Simple forward model for testing (would use real OPM in production)
+            def forward_model_fn(params):
+                fg = ForecastGenerator()
+                return {'production_data': fg._get_synthetic_production_data(100)}
+            
+            # Run EnKF
+            def progress_cb(progress, msg):
+                simulation.progress = int(progress)
+                simulation.current_step += 1
+                simulation.save()
+            
+            enkf_result = enkf.run_enkf(
+                observed_data={'production_data': {}},
+                forward_model_fn=forward_model_fn,
+                initial_ensemble=prior_ensemble,
+                num_iterations=num_iterations,
+                progress_callback=progress_cb
+            )
+            
+            if enkf_result.get('status') != 'completed':
+                return Response({'error': 'EnKF run failed'}, 
+                              status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+            # Extract posterior ensemble
+            posterior_ensemble = np.array(enkf_result['final_ensemble']).tolist()
+            
+            # Generate PRIOR forecast (before EnKF)
+            fg = ForecastGenerator()
+            prior_result = fg.generate_forecast(
+                str(simulation.id) + '_prior',
+                prior_ensemble.tolist(),
+                forward_model_fn,
+                'prior',
+                forecast_period_days
+            )
+            
+            # Generate POSTERIOR forecast (after EnKF)
+            posterior_result = fg.generate_forecast(
+                str(simulation.id) + '_posterior',
+                posterior_ensemble,
+                forward_model_fn,
+                'posterior',
+                forecast_period_days
+            )
+            
+            # Persist both forecasts
+            forecasts = []
+            
+            if prior_result.get('status') == 'completed':
+                prior_forecast = Forecast.objects.create(
+                    simulation=simulation,
+                    user=request.user,
+                    name=f"{simulation.name} - Prior Forecast",
+                    description="Prior forecast before EnKF calibration",
+                    forecast_type='prior',
+                    forecast_date=request.data.get('forecast_date') or None,
+                    forecast_period_days=forecast_period_days,
+                    predicted_parameters=prior_result['forecast'].get('predictions', {}),
+                    predictions=prior_result['forecast'].get('predictions', {}),
+                    uncertainty_bounds=prior_result['forecast'].get('uncertainty', {})
+                )
+                forecasts.append(ForecastSerializer(prior_forecast).data)
+            
+            if posterior_result.get('status') == 'completed':
+                posterior_forecast = Forecast.objects.create(
+                    simulation=simulation,
+                    user=request.user,
+                    name=f"{simulation.name} - Posterior Forecast",
+                    description="Posterior forecast after EnKF calibration",
+                    forecast_type='posterior',
+                    forecast_date=request.data.get('forecast_date') or None,
+                    forecast_period_days=forecast_period_days,
+                    predicted_parameters=posterior_result['forecast'].get('predictions', {}),
+                    predictions=posterior_result['forecast'].get('predictions', {}),
+                    uncertainty_bounds=posterior_result['forecast'].get('uncertainty', {})
+                )
+                forecasts.append(ForecastSerializer(posterior_forecast).data)
+            
+            # Update simulation with EnKF results
+            simulation.status = 'completed'
+            simulation.match_quality = float(enkf_result.get('best_quality', 0))
+            simulation.progress = 100
+            simulation.results_data = {
+                'enkf_result': {k: v for k, v in enkf_result.items() if k != 'final_ensemble'},
+                'prior_ensemble': prior_ensemble.tolist() if isinstance(prior_ensemble, np.ndarray) else prior_ensemble,
+                'posterior_ensemble': posterior_ensemble,
+            }
+            simulation.completed_at = timezone.now()
+            if simulation.started_at:
+                delta = simulation.completed_at - simulation.started_at
+                simulation.duration_seconds = int(delta.total_seconds())
+            simulation.save()
+            
+            # Update statistics
+            stats, _ = SimulationStatistics.objects.get_or_create(user=request.user)
+            stats.total_simulations += 1
+            stats.completed_simulations += 1
+            stats.enkf_simulations += 1
+            stats.total_forecasts_generated += 2  # prior + posterior
+            stats.best_match_quality = max(stats.best_match_quality, simulation.match_quality)
+            stats.save()
+            
+            return Response({
+                'message': 'EnKF with forecasts completed',
+                'simulation': SimulationRunDetailSerializer(simulation).data,
+                'forecasts': forecasts,
+                'enkf_quality': float(enkf_result.get('best_quality', 0))
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            logger.error(f"EnKF pipeline failed: {e}")
+            simulation.status = 'failed'
+            simulation.error_message = str(e)
+            simulation.save()
+            return Response({'error': str(e)}, 
+                          status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
     @action(detail=False, methods=['get'])
     def recent(self, request):
