@@ -2,6 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from users.models import UserActivityLog, CustomUser
 from simulations.models import Dataset, SimulationRun, Forecast, SimulationStatistics
+import sys
 
 User = get_user_model()
 
@@ -79,13 +80,66 @@ class UserActivityLogSerializer(serializers.ModelSerializer):
 
 class DatasetSerializer(serializers.ModelSerializer):
     file_url = serializers.SerializerMethodField()
-    file = serializers.FileField(write_only=True, required=True)
+    file = serializers.FileField(write_only=True, required=False, allow_null=True)
+    production_data = serializers.JSONField(write_only=False, required=False, allow_null=True)
     
     class Meta:
         model = Dataset
         fields = ['id', 'name', 'description', 'file', 'filename', 'file_size', 'uploaded_at',
                   'updated_at', 'file_url', 'production_data']
         read_only_fields = ['id', 'filename', 'file_size', 'uploaded_at', 'updated_at']
+    
+    def validate(self, data):
+        """Ensure either file or production_data is provided"""
+        file = data.get('file')
+        production_data = data.get('production_data')
+        
+        if not file and not production_data:
+            raise serializers.ValidationError(
+                "Either 'file' or 'production_data' must be provided."
+            )
+        
+        # If production_data is provided, validate its structure
+        if production_data and not file:
+            self._validate_production_data_structure(production_data)
+        
+        return data
+    
+    def _validate_production_data_structure(self, production_data):
+        """Validate production data has required fields for direct entry"""
+        if not isinstance(production_data, dict):
+            raise serializers.ValidationError(
+                "production_data must be a dictionary."
+            )
+        
+        # Check for production data (Days, Oil_bbl, Water_bbl, Gas_scf, Pressure_psi)
+        required_fields = ['Days', 'Oil_bbl', 'Water_bbl', 'Gas_scf', 'Pressure_psi']
+        has_production_fields = all(field in production_data for field in required_fields)
+        
+        # Or check for reservoir model
+        has_reservoir_model = 'reservoir_model' in production_data
+        
+        if not (has_production_fields or has_reservoir_model):
+            raise serializers.ValidationError(
+                "production_data must contain either production fields "
+                "(Days, Oil_bbl, Water_bbl, Gas_scf, Pressure_psi) or a 'reservoir_model' object."
+            )
+        
+        # If production fields exist, validate they're all lists/arrays of same length
+        if has_production_fields:
+            lengths = {field: len(production_data[field]) 
+                      for field in required_fields 
+                      if isinstance(production_data[field], (list, tuple))}
+            
+            if lengths and len(set(lengths.values())) > 1:
+                raise serializers.ValidationError(
+                    f"All production data arrays must have the same length. Got: {lengths}"
+                )
+            
+            if not lengths or min(lengths.values()) < 1:
+                raise serializers.ValidationError(
+                    "Production data must contain at least one data point."
+                )
     
     def get_file_url(self, obj):
         request = self.context.get('request')
@@ -94,13 +148,30 @@ class DatasetSerializer(serializers.ModelSerializer):
         return None
     
     def create(self, validated_data):
-        file = validated_data.pop('file')
-        dataset = Dataset.objects.create(
-            file=file,
-            filename=file.name,
-            file_size=file.size,
-            **validated_data
-        )
+        file = validated_data.pop('file', None)
+        production_data = validated_data.pop('production_data', None)
+        
+        print(f"[DATASET CREATE] file={file}, production_data keys={list(production_data.keys()) if production_data else None}", file=sys.stderr, flush=True)
+        
+        if file:
+            # File-based upload (existing behavior)
+            dataset = Dataset.objects.create(
+                file=file,
+                filename=file.name,
+                file_size=file.size,
+                **validated_data
+            )
+        else:
+            # Direct production_data entry (new behavior)
+            dataset = Dataset.objects.create(
+                file=None,
+                filename=f"manual_entry_{validated_data.get('name', 'dataset')}",
+                file_size=0,
+                production_data=production_data,
+                **validated_data
+            )
+        
+        print(f"[DATASET CREATE] SUCCESS - dataset id={dataset.id}", file=sys.stderr, flush=True)
         return dataset
 
 
@@ -142,7 +213,91 @@ class SimulationRunCreateSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
     
     def create(self, validated_data):
-        validated_data['user'] = self.context['request'].user
+        request = self.context['request']
+        validated_data['user'] = request.user
+
+        # If a dataset with a parsed reservoir model was attached, and the
+        # user did not supply initial reservoir parameters, try to infer
+        # sensible defaults from the uploaded model JSON.
+        dataset = validated_data.get('dataset')
+        missing_params = any(validated_data.get(k) in (None, '') for k in (
+            'initial_pressure', 'porosity', 'permeability', 'water_saturation'
+        ))
+
+        if dataset and missing_params:
+            try:
+                prod = getattr(dataset, 'production_data', {}) or {}
+                # Prefer explicitly stored reservoir_model, otherwise fall back
+                rm = prod.get('reservoir_model') if isinstance(prod, dict) else None
+                if not rm:
+                    # Could be raw_json or other structure
+                    if isinstance(prod, dict) and prod.get('raw_json'):
+                        rm = prod.get('raw_json')
+                    else:
+                        rm = prod if isinstance(prod, dict) else None
+
+                if isinstance(rm, dict):
+                    # Extract candidates from common locations
+                    ip = rm.get('initial_pressure') or rm.get('pressure')
+                    por = rm.get('porosity')
+                    perm = rm.get('permeability')
+                    wsat = rm.get('water_saturation') or rm.get('waterSat') or rm.get('sw')
+
+                    # Check nested sections
+                    if 'fluid_properties' in rm and isinstance(rm['fluid_properties'], dict):
+                        fp = rm['fluid_properties']
+                        ip = ip or fp.get('initial_pressure') or fp.get('pressure')
+                        wsat = wsat or fp.get('water_saturation') or fp.get('waterSat')
+
+                    if 'rock_properties' in rm and isinstance(rm['rock_properties'], dict):
+                        rp = rm['rock_properties']
+                        por = por or rp.get('porosity') or rp.get('poro')
+                        perm = perm or rp.get('permeability') or rp.get('perm')
+
+                    # If porosity/permeability are arrays (per-cell), take the mean
+                    try:
+                        if isinstance(por, (list, tuple)) and por:
+                            por = sum(float(x) for x in por) / len(por)
+                    except Exception:
+                        por = None
+
+                    try:
+                        if isinstance(perm, (list, tuple)) and perm:
+                            perm = sum(float(x) for x in perm) / len(perm)
+                    except Exception:
+                        perm = None
+
+                    # Normalize porosity/water saturation if provided as percentage
+                    try:
+                        if isinstance(por, (int, float)) and por > 1:
+                            por = float(por) / 100.0
+                    except Exception:
+                        pass
+
+                    try:
+                        if isinstance(wsat, (int, float)) and wsat > 1:
+                            wsat = float(wsat) / 100.0
+                    except Exception:
+                        pass
+
+                    # Set values only when missing and when we have a valid numeric value
+                    def set_if_missing(key, value):
+                        if value is None:
+                            return
+                        if validated_data.get(key) in (None, ''):
+                            try:
+                                validated_data[key] = float(value)
+                            except Exception:
+                                pass
+
+                    set_if_missing('initial_pressure', ip)
+                    set_if_missing('porosity', por)
+                    set_if_missing('permeability', perm)
+                    set_if_missing('water_saturation', wsat)
+            except Exception:
+                # Fail silently: fallback to whatever the user provided or defaults
+                pass
+
         return super().create(validated_data)
 
 
@@ -178,3 +333,40 @@ class DashboardSummarySerializer(serializers.Serializer):
     def to_representation(self, instance):
         """Custom representation to handle dict/object mixing"""
         return instance
+
+
+# ============ Sensitivity Analysis Request Serializers (embedded from external tool)
+class WellDatasetRowSerializer(serializers.Serializer):
+    well_name = serializers.CharField()
+    true_vertical_depth_ft = serializers.FloatField(min_value=1000)
+    tubing_id_in = serializers.FloatField(min_value=1.0)
+    reservoir_pressure_psia = serializers.FloatField(min_value=100)
+    bubble_point_pressure_psia = serializers.FloatField(min_value=50)
+    productivity_index_bpd_psi = serializers.FloatField(min_value=0.01)
+    wellhead_pressure_psig = serializers.FloatField(min_value=0)
+    water_cut_fraction = serializers.FloatField(min_value=0, max_value=0.99)
+    oil_api = serializers.FloatField(min_value=10, max_value=60)
+    gas_specific_gravity = serializers.FloatField(min_value=0.55, max_value=1.5)
+    oil_specific_gravity = serializers.FloatField(min_value=0.6, max_value=1.1)
+    gas_oil_ratio_scf_stb = serializers.FloatField(min_value=0)
+    temperature_f = serializers.FloatField(min_value=60, max_value=350)
+
+
+class SensitivityRequestSerializer(serializers.Serializer):
+    dataset_row = WellDatasetRowSerializer()
+    gas_injection_min_mmscfpd = serializers.FloatField(min_value=0)
+    gas_injection_max_mmscfpd = serializers.FloatField(min_value=0)
+    gas_injection_step_mmscfpd = serializers.FloatField(min_value=0.05)
+    wellhead_pressure_psig_values = serializers.ListField(
+        child=serializers.FloatField(min_value=0), allow_empty=False
+    )
+    water_cut_fraction_values = serializers.ListField(
+        child=serializers.FloatField(min_value=0, max_value=0.99), allow_empty=False
+    )
+
+    def validate(self, attrs: dict):
+        if attrs["gas_injection_max_mmscfpd"] < attrs["gas_injection_min_mmscfpd"]:
+            raise serializers.ValidationError(
+                "gas_injection_max_mmscfpd must be greater than or equal to gas_injection_min_mmscfpd."
+            )
+        return attrs

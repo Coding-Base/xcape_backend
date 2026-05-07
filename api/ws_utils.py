@@ -19,18 +19,25 @@ async def broadcast_simulation_progress(simulation_id, message, iteration=0, sta
         status: Current status ('processing', 'calibrating', 'forecasting', etc.)
     """
     channel_layer = get_channel_layer()
+    if not channel_layer:
+        # Channels layer not configured; silently skip broadcasting
+        return
+
     room_group_name = f'simulation_{simulation_id}_progress'
-    
-    await channel_layer.group_send(
-        room_group_name,
-        {
-            'type': 'simulation_progress',
-            'message': message,
-            'iteration': iteration,
-            'status': status,
-            'timestamp': datetime.now().isoformat(),
-        }
-    )
+    try:
+        await channel_layer.group_send(
+            room_group_name,
+            {
+                'type': 'simulation_progress',
+                'message': message,
+                'iteration': iteration,
+                'status': status,
+                'timestamp': datetime.now().isoformat(),
+            }
+        )
+    except Exception:
+        # Fail silently if broadcasting is not available (e.g., channels not installed)
+        return
 
 
 async def broadcast_simulation_complete(simulation_id, match_quality=None, best_iteration=None, duration=None):
@@ -44,18 +51,23 @@ async def broadcast_simulation_complete(simulation_id, match_quality=None, best_
         duration: Total duration in seconds
     """
     channel_layer = get_channel_layer()
+    if not channel_layer:
+        return
+
     room_group_name = f'simulation_{simulation_id}_progress'
-    
-    await channel_layer.group_send(
-        room_group_name,
-        {
-            'type': 'simulation_complete',
-            'message': 'Simulation completed successfully',
-            'match_quality': match_quality,
-            'best_iteration': best_iteration,
-            'duration': duration,
-        }
-    )
+    try:
+        await channel_layer.group_send(
+            room_group_name,
+            {
+                'type': 'simulation_complete',
+                'message': 'Simulation completed successfully',
+                'match_quality': match_quality,
+                'best_iteration': best_iteration,
+                'duration': duration,
+            }
+        )
+    except Exception:
+        return
 
 
 async def broadcast_simulation_error(simulation_id, error_message, stack_trace=None):
@@ -68,16 +80,21 @@ async def broadcast_simulation_error(simulation_id, error_message, stack_trace=N
         stack_trace: Optional stack trace for debugging
     """
     channel_layer = get_channel_layer()
+    if not channel_layer:
+        return
+
     room_group_name = f'simulation_{simulation_id}_progress'
-    
-    await channel_layer.group_send(
-        room_group_name,
-        {
-            'type': 'simulation_error',
-            'error': error_message,
-            'stack_trace': stack_trace,
-        }
-    )
+    try:
+        await channel_layer.group_send(
+            room_group_name,
+            {
+                'type': 'simulation_error',
+                'error': error_message,
+                'stack_trace': stack_trace,
+            }
+        )
+    except Exception:
+        return
 
 
 def run_async_broadcast(coro):

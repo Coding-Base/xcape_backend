@@ -25,10 +25,74 @@ class OPMFlowWrapper:
     def _find_opm_executable(self) -> Optional[str]:
         """Find OPM Flow executable in system PATH"""
         try:
-            # Try to find flow executable
-            result = subprocess.run(['which', 'flow'], capture_output=True, text=True)
-            if result.returncode == 0:
-                return result.stdout.strip()
+            # Allow overriding via environment variable first
+            env_path = os.environ.get('OPM_FLOW_EXEC') or os.environ.get('OPM_FLOW_PATH')
+
+            def normalize(p: str) -> str:
+                if not p:
+                    return p
+                p = p.strip().strip('"').strip("'")
+                p = os.path.expanduser(os.path.expandvars(p))
+                return p
+
+            if env_path:
+                env_path = normalize(env_path)
+                # Direct path (file or .bat) provided
+                if os.path.exists(env_path):
+                    return env_path
+                # If a directory was provided, look for common binaries including .bat wrappers
+                if os.path.isdir(env_path):
+                    for name in ('flow', 'flow.exe', 'flow.bat', 'opm_flow.bat'):
+                        candidate = os.path.join(env_path, name)
+                        if os.path.exists(candidate):
+                            return candidate
+
+            # If no env var or it didn't resolve, attempt to read a .env file in repo root(s)
+            try:
+                here = Path(__file__).resolve()
+                for parent in list(here.parents)[:6]:
+                    env_file = parent / '.env'
+                    if env_file.exists():
+                        try:
+                            content = env_file.read_text(encoding='utf-8')
+                            for line in content.splitlines():
+                                if 'OPM_FLOW_EXEC' in line:
+                                    # parse assignment
+                                    parts = line.split('=', 1)
+                                    if len(parts) == 2:
+                                        candidate = normalize(parts[1])
+                                        # strip possible surrounding quotes and whitespace
+                                        candidate = candidate.strip()
+                                        candidate = candidate.strip('"').strip("'")
+                                        if os.path.exists(candidate):
+                                            return candidate
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # Use shutil.which to find executable cross-platform
+            try:
+                import shutil
+                exe = shutil.which('flow') or shutil.which('flow.exe') or shutil.which('flow.bat')
+                if exe:
+                    return exe
+                # also attempt basename of env_path if provided
+                if env_path:
+                    base = os.path.basename(env_path)
+                    exe = shutil.which(base)
+                    if exe:
+                        return exe
+            except Exception:
+                pass
+
+            # Fallback: try POSIX 'which' for Unix-like environments
+            try:
+                result = subprocess.run(['which', 'flow'], capture_output=True, text=True)
+                if result.returncode == 0:
+                    return result.stdout.strip()
+            except Exception:
+                pass
         except Exception as e:
             logger.warning(f"Could not find OPM Flow executable: {e}")
         return None

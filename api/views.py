@@ -1,4 +1,6 @@
 from rest_framework import viewsets, status, permissions
+from rest_framework.views import APIView
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.authtoken.models import Token
@@ -28,6 +30,7 @@ from api.serializers import (
 from simulator.forecast_generator import ForecastGenerator
 from simulator.enkf_filter import EnKFFilter
 from simulator.engine import SimulationEngine
+from simulator.interpretation import interpret_simulation_results
 
 User = get_user_model()
 from rest_framework.response import Response
@@ -417,6 +420,257 @@ class DashboardViewSet(viewsets.ViewSet):
         }
         
         return Response(data, status=status.HTTP_200_OK)
+
+
+# ============ Sensitivity Analysis Compatibility Endpoints ============
+class SensitivityHealthView(APIView):
+    """Simple health endpoint for embedded sensitivity app"""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        return Response({"status": "ok"})
+
+
+class SensitivityDatasetPreviewView(APIView):
+    """Accept a CSV/JSON upload and return a small preview row."""
+    permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        upload = request.FILES.get("file")
+        if not upload:
+            return Response({"detail": "No file was uploaded."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            raw = upload.read().decode('utf-8')
+            # Quick heuristic: CSV header -> return first data row as dict
+            if '\n' in raw and ',' in raw.splitlines()[0]:
+                import csv
+                reader = csv.DictReader(raw.splitlines())
+                first = None
+                for r in reader:
+                    first = r
+                    break
+                return Response({"dataset_row": first})
+            else:
+                # Try JSON
+                import json
+                parsed = json.loads(raw)
+                # If it's an object with keys matching typical well fields, return a small mapping
+                return Response({"dataset_row": parsed})
+        except Exception as e:
+            return Response({"detail": f"Error parsing upload: {e}"}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class SensitivitySimulationView(APIView):
+    """Run a quick sensitivity analysis using a lightweight internal runner.
+
+    This is a minimal merge of the New Project simulation endpoint into XCAPE.
+    The implementation returns deterministic mock results suitable for embedding
+    and testing; replace with the full nodal analysis integration when ready.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        from api.serializers import SensitivityRequestSerializer
+
+        serializer = SensitivityRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.validated_data
+
+        # Minimal internal runner: compute combinations count and return full scenario profiles
+        gas_min = payload['gas_injection_min_mmscfpd']
+        gas_max = payload['gas_injection_max_mmscfpd']
+        gas_step = payload['gas_injection_step_mmscfpd']
+        gas_steps = int(max(1, (gas_max - gas_min) / gas_step + 1)) if gas_step > 0 else 1
+        wellhead_cases = payload['wellhead_pressure_psig_values']
+        watercut_cases = payload['water_cut_fraction_values']
+        dataset = payload['dataset_row']
+
+        total_cases = gas_steps * len(wellhead_cases) * len(watercut_cases)
+
+        def build_operating_point(whp, wc, gi_rate=0.5):
+            # Enhanced Vogel IPR with proper wellhead pressure dependency
+            pr = dataset['reservoir_pressure_psia']
+            pb = dataset['bubble_point_pressure_psia']
+            pi = dataset['productivity_index_bpd_psi']
+            tvd = dataset['true_vertical_depth_ft']
+            
+            # Calculate bubble point corrected PI
+            pi_corrected = pi * (0.7 if pr < pb else 1.0)
+            
+            # Vogel maximum potential rate at zero drawdown
+            pr_ratio = max(0.1, min(1.0, pr / pb)) if pb > 0 else 1.0
+            vogel_q_max = pi_corrected * pr * (1.9 * pr_ratio - 0.9 * pr_ratio**2)
+            
+            # Skin effect and water cut reduction
+            skin_factor = 1.0 - wc * 0.35 - max(0, (tvd - 5000) / 10000) * 0.15
+            skin_factor = max(0.3, skin_factor)
+            
+            # Gas lift effect
+            glift_factor = 1.0 + (gi_rate / 4.0) * 0.25
+            
+            # Iteratively solve for oil rate and pwf considering tubing pressure drop
+            # This properly models the effect of wellhead pressure on oil rate
+            pwf = pr * 0.7  # Initial guess: pwf at 70% of reservoir pressure
+            oil_rate = 0
+            
+            for iteration in range(5):  # Iterate to convergence
+                # Tubing pressure drop correlates with flow rate and water cut
+                tubing_friction = oil_rate * 0.008 * (1 + wc)
+                
+                # Pwf must be at least whp + tubing drop to surface
+                pwf_min = whp + tubing_friction
+                
+                # Use Vogel to find oil rate at this pwf
+                if pr > 0 and pb > 0:
+                    pwf_ratio = max(0.0, min(1.0, pwf_min / pb))
+                    if pwf_min >= pb:
+                        # Subsaturated (pwf > pb): linear relationship
+                        q_achievable = vogel_q_max * (1.0 - 0.2 * (pwf_min - pb) / (pr - pb))
+                    else:
+                        # Saturated (pwf < pb): Vogel equation
+                        vogel_ratio = 1.9 * pwf_ratio - 0.9 * pwf_ratio**2
+                        q_achievable = vogel_q_max * vogel_ratio
+                else:
+                    q_achievable = vogel_q_max
+                
+                # Apply corrections
+                oil_rate = max(50.0, q_achievable * skin_factor * glift_factor)
+                pwf = pwf_min
+                
+                # Convergence check
+                if iteration > 1 and abs(oil_rate - prev_rate) < 1.0:
+                    break
+                prev_rate = oil_rate
+            
+            oil_rate = round(oil_rate, 2)
+            liquid_rate = round(oil_rate / max(0.15, 1.0 - wc) + (oil_rate * wc * 0.5), 2)
+            pwf = round(pwf, 2)
+            
+            # Bottomhole pressure includes friction
+            friction_loss = oil_rate * 0.008 * (1 + wc)
+            bottomhole = round(pwf + friction_loss, 2)
+            pressure_mismatch = round(abs(bottomhole - pwf), 2)
+            
+            return {
+                'oil_rate_bpd': oil_rate,
+                'liquid_rate_bpd': liquid_rate,
+                'pwf_psia': pwf,
+                'bottomhole_pressure_psia': bottomhole,
+                'pressure_mismatch_psia': pressure_mismatch,
+            }
+
+        def build_ipr_curve(pr, q_target):
+            points = []
+            for ratio in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
+                pwf = round(pr * ratio, 2)
+                q = round(q_target * (ratio / (1.0 + 0.15 * ratio)) if ratio > 0 else 0, 2)
+                points.append({'pwf_psia': pwf, 'oil_rate_bpd': max(0.0, q)})
+            return points
+
+        def build_vlp_curve(whp, q_target):
+            points = []
+            for ratio in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
+                q = round(q_target * ratio, 2)
+                pwf = round(whp + 30.0 + q * 0.03, 2)
+                points.append({'pwf_psia': pwf, 'oil_rate_bpd': q})
+            return points
+
+        def build_pressure_profile(whp, wc):
+            profile = []
+            for depth in [0.0, dataset['true_vertical_depth_ft'] * 0.33, dataset['true_vertical_depth_ft'] * 0.66, float(dataset['true_vertical_depth_ft'])]:
+                density = round(40.0 + wc * 15.0 + depth / 2500.0, 2)
+                pressure = round(whp + 0.433 * density * depth / 1000.0, 2)
+                holdup = round(min(1.0, max(0.2, 0.55 + wc * 0.18 - depth / 15000.0)), 3)
+                profile.append({
+                    'depth_ft': round(depth, 0),
+                    'pressure_psia': pressure,
+                    'mixture_density_lbft3': density,
+                    'liquid_holdup': holdup,
+                })
+            return profile
+
+        results = {
+            'total_cases': total_cases,
+            'gas_steps': gas_steps,
+            'wellhead_cases': len(wellhead_cases),
+            'watercut_cases': len(watercut_cases),
+            'summary': {
+                'expected_oil_gain_percent': 5.0,
+                'expected_gas_used_mmscf': round((gas_min + gas_max) / 2 * gas_steps, 2),
+            },
+            'cases_preview': [],
+            'scenarios': [],
+            'gas_rates_mmscfpd': [round(gas_min + i * gas_step, 3) for i in range(gas_steps)],
+        }
+
+        for step_index in range(gas_steps):
+            gi = round(min(gas_max, gas_min + step_index * gas_step), 3)
+            for gh in wellhead_cases:
+                for wc in watercut_cases:
+                    op = build_operating_point(gh, wc, gi)
+                    scenario = {
+                        'gas_injection_mmscfpd': gi,
+                        'wellhead_pressure_psig': gh,
+                        'water_cut_fraction': wc,
+                        'operating_point': op,
+                        'ipr_curve': build_ipr_curve(op['pwf_psia'], op['oil_rate_bpd'] * 1.1),
+                        'vlp_curve': build_vlp_curve(gh, op['oil_rate_bpd'] * 1.1),
+                        'pressure_profile': build_pressure_profile(gh, wc),
+                    }
+                    results['scenarios'].append(scenario)
+                    if len(results['cases_preview']) < 8:
+                        results['cases_preview'].append({
+                            'gas_injection_mmscfpd': gi,
+                            'wellhead_pressure_psig': gh,
+                            'water_cut_fraction': wc,
+                            'predicted_oil_bbl': round(op['oil_rate_bpd'] * 1.02, 2),
+                        })
+
+        results['best_case'] = max(results['scenarios'], key=lambda s: s['operating_point']['oil_rate_bpd'])
+        results['scenario_count'] = total_cases
+
+        # Add well_name from dataset
+        results['well_name'] = dataset.get('well_name', 'Unknown Well')
+
+        # Aggregate performance data by gas injection rate for smooth performance curves
+        aggregated_performance = {}
+        for scenario in results['scenarios']:
+            gi = scenario['gas_injection_mmscfpd']
+            oil_rate = scenario['operating_point']['oil_rate_bpd']
+            
+            if gi not in aggregated_performance:
+                aggregated_performance[gi] = []
+            aggregated_performance[gi].append(oil_rate)
+        
+        # Convert aggregation to sorted list with statistics
+        results['performance_envelope'] = []
+        for gi in sorted(aggregated_performance.keys()):
+            rates = aggregated_performance[gi]
+            results['performance_envelope'].append({
+                'gas_injection_mmscfpd': gi,
+                'oil_rate_min_bpd': round(min(rates), 2),
+                'oil_rate_avg_bpd': round(sum(rates) / len(rates), 2),
+                'oil_rate_max_bpd': round(max(rates), 2),
+                'scenario_count': len(rates)
+            })
+
+        # Persist a SimulationRun record for traceability (optional)
+        try:
+            sim = SimulationRun.objects.create(
+                user=request.user,
+                name=f"Sensitivity run ({request.user.username})",
+                matching_type='sensitivity',
+                status='completed',
+                progress=100,
+                results_data=results
+            )
+        except Exception:
+            # Non-fatal: ignore DB persistence errors
+            pass
+
+        return Response(results)
     
     @action(detail=False, methods=['get'])
     def statistics(self, request):
@@ -440,79 +694,136 @@ class DatasetViewSet(viewsets.ModelViewSet):
         return Dataset.objects.filter(user=self.request.user)
     
     def perform_create(self, serializer):
-        """Attach current user to dataset and parse CSV"""
-        dataset = serializer.save(user=self.request.user)
+        """Attach current user to dataset and parse CSV or JSON files
         
-        # Parse uploaded CSV file if it's production data
-        if dataset.file:
-            try:
-                import csv
-                print(f"[DATASET] Parsing CSV file: {dataset.filename}", file=sys.stderr, flush=True)
-                
-                # Read CSV file
-                dataset.file.seek(0)
-                csv_reader = csv.DictReader(dataset.file.read().decode('utf-8').splitlines())
-                
-                if not csv_reader.fieldnames:
-                    raise ValueError("CSV file is empty or has no header")
-                
-                print(f"[DATASET] CSV columns found: {list(csv_reader.fieldnames)}", file=sys.stderr, flush=True)
-                
-                # Parse columns (flexible naming)
-                column_mapping = {
-                    'Oil_bbl': ['Oil_bbl', 'oil', 'Oil', 'OilRate', 'oil_bbl'],
-                    'Water_bbl': ['Water_bbl', 'water', 'Water', 'WaterRate', 'water_bbl'],
-                    'Gas_scf': ['Gas_scf', 'gas', 'Gas', 'GasRate', 'gas_scf', 'gas_mcf', 'Gas_mcf', 'gas_MCF'],
-                    'Pressure_psi': ['Pressure_psi', 'pressure', 'Pressure', 'Pres', 'pressure_psi'],
-                    'Days': ['Days', 'days', 'Day', 'day', 'Time']
-                }
-                
-                # Find actual columns in CSV
-                actual_columns = {}
-                for output_key, aliases in column_mapping.items():
-                    for alias in aliases:
-                        if alias in csv_reader.fieldnames:
-                            actual_columns[output_key] = alias
-                            break
-                
-                print(f"[DATASET] Mapped columns: {actual_columns}", file=sys.stderr, flush=True)
-                data = {
-                    'Days': [],
-                    'Oil_bbl': [],
-                    'Water_bbl': [],
-                    'Gas_scf': [],
-                    'Pressure_psi': []
-                }
-                
-                # Re-read CSV since we already iterated
-                dataset.file.seek(0)
-                csv_reader = csv.DictReader(dataset.file.read().decode('utf-8').splitlines())
-                
-                for row_num, row in enumerate(csv_reader, 1):
-                    try:
-                        for output_key, input_key in actual_columns.items():
-                            value = row.get(input_key, '').strip()
-                            if value:
-                                data[output_key].append(float(value))
-                            else:
-                                data[output_key].append(0.0)
-                    except (ValueError, KeyError) as e:
-                        print(f"[DATASET] Warning parsing row {row_num}: {e}", file=sys.stderr, flush=True)
-                        continue
-                
-                if data['Oil_bbl']:  # Check if we got data
-                    dataset.production_data = data
-                    dataset.save()
-                    print(f"[DATASET] SUCCESS Parsed {len(data['Oil_bbl'])} rows of data", file=sys.stderr, flush=True)
-                    print(f"[DATASET] Oil range: {min(data['Oil_bbl']):.0f} - {max(data['Oil_bbl']):.0f}", 
-                          file=sys.stderr, flush=True)
-                else:
-                    print(f"[DATASET] WARNING: No valid data extracted from CSV", file=sys.stderr, flush=True)
-                    
-            except Exception as e:
-                print(f"[DATASET] ERROR parsing CSV: {e}", file=sys.stderr, flush=True)
-                import traceback
-                traceback.print_exc(file=sys.stderr)
+        Handles three data sources:
+        - File upload (CSV or JSON) - existing behavior
+        - Direct production_data JSON (manual entry) - new behavior
+        - If a JSON file is uploaded and appears to be a reservoir model, store
+          it under `dataset.production_data['reservoir_model']` so downstream
+          code (e.g. simulation creation) can pick up parameters.
+        - Otherwise, fall back to the existing CSV parsing logic.
+        """
+        dataset = serializer.save(user=self.request.user)
+
+        # Case 1: Direct production_data provided (manual entry) - already validated by serializer
+        if dataset.production_data and not dataset.file:
+            print(f"[DATASET] Saved manual entry dataset with production_data", file=sys.stderr, flush=True)
+            if 'Days' in dataset.production_data:
+                print(f"[DATASET] Production data: {len(dataset.production_data['Days'])} data points", 
+                      file=sys.stderr, flush=True)
+            elif 'reservoir_model' in dataset.production_data:
+                print(f"[DATASET] Reservoir model data saved", file=sys.stderr, flush=True)
+            return
+
+        # Case 2: No file and no production_data - nothing to do
+        if not dataset.file:
+            return
+
+        # Case 3: File-based upload - parse CSV or JSON file
+        # Try JSON reservoir model parsing first (if filename ends with .json)
+        try:
+            dataset.file.seek(0)
+            filename = (dataset.filename or '').lower()
+            if filename.endswith('.json'):
+                try:
+                    import json, traceback
+                    raw = dataset.file.read().decode('utf-8')
+                    parsed = json.loads(raw)
+
+                    # Heuristic: treat as reservoir model if it contains common keys
+                    if isinstance(parsed, dict) and any(k in parsed for k in (
+                            'rock_properties', 'fluid_properties', 'grid', 'cells',
+                            'initial_pressure', 'porosity', 'permeability', 'water_saturation')):
+                        dataset.production_data = {'reservoir_model': parsed}
+                        dataset.save(update_fields=['production_data'])
+                        print(f"[DATASET] Parsed JSON reservoir model; stored in production_data['reservoir_model']",
+                              file=sys.stderr, flush=True)
+                    else:
+                        # Store raw JSON under production_data for later inspection
+                        dataset.production_data = {'raw_json': parsed}
+                        dataset.save(update_fields=['production_data'])
+                        print(f"[DATASET] JSON file uploaded and stored under production_data['raw_json']",
+                              file=sys.stderr, flush=True)
+                    return
+                except Exception as je:
+                    print(f"[DATASET] ERROR parsing JSON: {je}", file=sys.stderr, flush=True)
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
+        except Exception as e:
+            print(f"[DATASET] ERROR reading uploaded file: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+
+        # Fallback: attempt to parse as CSV (existing behavior)
+        try:
+            import csv
+            print(f"[DATASET] Parsing CSV file: {dataset.filename}", file=sys.stderr, flush=True)
+
+            # Read CSV file
+            dataset.file.seek(0)
+            csv_reader = csv.DictReader(dataset.file.read().decode('utf-8').splitlines())
+
+            if not csv_reader.fieldnames:
+                raise ValueError("CSV file is empty or has no header")
+
+            print(f"[DATASET] CSV columns found: {list(csv_reader.fieldnames)}", file=sys.stderr, flush=True)
+
+            # Map possible column name variations
+            column_mapping = {
+                'Oil_bbl': ['Oil_bbl', 'oil', 'Oil', 'OilRate', 'oil_bbl'],
+                'Water_bbl': ['Water_bbl', 'water', 'Water', 'WaterRate', 'water_bbl'],
+                'Gas_scf': ['Gas_scf', 'gas', 'Gas', 'GasRate', 'gas_scf', 'gas_mcf', 'Gas_mcf', 'gas_MCF'],
+                'Pressure_psi': ['Pressure_psi', 'pressure', 'Pressure', 'Pres', 'pressure_psi'],
+                'Days': ['Days', 'days', 'Day', 'day', 'Time']
+            }
+
+            # Find actual columns in CSV
+            actual_columns = {}
+            for output_key, aliases in column_mapping.items():
+                for alias in aliases:
+                    if alias in csv_reader.fieldnames:
+                        actual_columns[output_key] = alias
+                        break
+
+            print(f"[DATASET] Mapped columns: {actual_columns}", file=sys.stderr, flush=True)
+            data = {
+                'Days': [],
+                'Oil_bbl': [],
+                'Water_bbl': [],
+                'Gas_scf': [],
+                'Pressure_psi': []
+            }
+
+            # Re-read CSV since DictReader was consumed
+            dataset.file.seek(0)
+            csv_reader = csv.DictReader(dataset.file.read().decode('utf-8').splitlines())
+
+            for row_num, row in enumerate(csv_reader, 1):
+                try:
+                    for output_key, input_key in actual_columns.items():
+                        value = row.get(input_key, '').strip()
+                        if value:
+                            data[output_key].append(float(value))
+                        else:
+                            data[output_key].append(0.0)
+                except (ValueError, KeyError) as e:
+                    print(f"[DATASET] Warning parsing row {row_num}: {e}", file=sys.stderr, flush=True)
+                    continue
+
+            if data['Oil_bbl']:  # Check if we got data
+                dataset.production_data = data
+                dataset.save()
+                print(f"[DATASET] SUCCESS Parsed {len(data['Oil_bbl'])} rows of data", file=sys.stderr, flush=True)
+                print(f"[DATASET] Oil range: {min(data['Oil_bbl']):.0f} - {max(data['Oil_bbl']):.0f}", 
+                      file=sys.stderr, flush=True)
+            else:
+                print(f"[DATASET] WARNING: No valid data extracted from CSV", file=sys.stderr, flush=True)
+
+        except Exception as e:
+            print(f"[DATASET] ERROR parsing CSV: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
     
     @action(detail=False, methods=['get'])
     def recent(self, request):
@@ -524,13 +835,13 @@ class DatasetViewSet(viewsets.ModelViewSet):
 
 class SimulationRunViewSet(viewsets.ModelViewSet):
     """Manage simulation runs"""
-    
+
     permission_classes = [IsAuthenticated]
-    
+
     def get_queryset(self):
         """Users can only see their own simulations"""
         return SimulationRun.objects.filter(user=self.request.user)
-    
+
     def get_serializer_class(self):
         """Use different serializer based on action"""
         if self.action == 'create':
@@ -538,7 +849,7 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
         elif self.action == 'retrieve':
             return SimulationRunDetailSerializer
         return SimulationRunListSerializer
-    
+
     def perform_create(self, serializer):
         """Attach current user to simulation"""
         simulation = serializer.save(user=self.request.user)
@@ -548,7 +859,7 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             activity_type='simulation_start',
             description=f"Started {simulation.matching_type} simulation: {simulation.name}"
         )
-    
+
     @action(detail=True, methods=['post'])
     def start(self, request, pk=None):
         """Start/resume a simulation"""
@@ -557,16 +868,16 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             return Response({
                 'error': 'Cannot start a completed or failed simulation'
             }, status=status.HTTP_400_BAD_REQUEST)
-        
+
         simulation.status = 'running'
         simulation.started_at = timezone.now()
         simulation.progress = 0
         simulation.save()
-        
+
         print(f"\n[API START] About to start baseline simulation {simulation.id}", file=sys.stderr, flush=True)
         print(f"[API START] Simulation matching_type: '{simulation.matching_type}'", file=sys.stderr, flush=True)
         print(f"[API START] Simulation matching_type == 'baseline': {simulation.matching_type == 'baseline'}", file=sys.stderr, flush=True)
-        
+
         # Start baseline simulation in background thread
         if simulation.matching_type == 'baseline':
             print(f"[API START] Creating background thread for simulation {simulation.id}", file=sys.stderr, flush=True)
@@ -586,7 +897,7 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                 traceback.print_exc(file=sys.stderr)
         else:
             print(f"[API START] NOT a baseline simulation, skipping thread", file=sys.stderr, flush=True)
-        
+
         return Response({
             'message': 'Simulation started',
             'simulation': SimulationRunDetailSerializer(simulation).data
@@ -735,13 +1046,19 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                 water_sat = simulation.water_saturation or 0.3
                 init_press = simulation.initial_pressure or 3000
             
+            # Normalize porosity/water units: handle percent inputs (>1) by converting to fraction
+            if poros > 1.0:
+                poros = poros / 100.0
+            if water_sat > 1.0:
+                water_sat = water_sat / 100.0
+
             # Normalize parameters to scaling factors
             perm_scale = np.clip(0.7 + (perm / 500.0) * 0.6, 0.5, 1.5)
             poros_scale = np.clip(0.7 + (poros / 0.3) * 0.6, 0.5, 1.5)
             water_scale = np.clip(0.5 + (water_sat * 1.5), 0.5, 2.0)
-            oil_scale = 2.0 - water_scale
+            oil_scale = max(0.1, 2.0 - water_scale)
             press_scale = np.clip(0.8 + (init_press / 4000.0) * 0.4, 0.8, 1.2)
-            production_scale = perm_scale * poros_scale
+            production_scale = np.clip(perm_scale * poros_scale, 0.3, 3.0)
             
             # Apply parameter-based scaling with noise for ensemble diversity
             obs_oil = np.array(observed_data['oil'], dtype=float)[:N]
@@ -749,9 +1066,10 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             obs_gas = np.array(observed_data['gas'], dtype=float)[:N]
             obs_pressure = np.array(observed_data['pressure'], dtype=float)[:N]
             
-            oil_array = obs_oil * oil_scale * production_scale * (0.8 + np.random.random() * 0.4)
-            water_array = obs_water * water_scale * production_scale * (0.7 + np.random.random() * 0.6)
-            gas_array = obs_gas * production_scale * perm_scale * (0.75 + np.random.random() * 0.5)
+            # Reduce random jitter amplitude to keep ensemble runs near observed scale
+            oil_array = obs_oil * oil_scale * production_scale * (0.9 + np.random.random() * 0.2)
+            water_array = obs_water * water_scale * production_scale * (0.9 + np.random.random() * 0.2)
+            gas_array = obs_gas * production_scale * perm_scale * (0.9 + np.random.random() * 0.2)
             pressure_array = obs_pressure * press_scale + (21 - 5) * np.random.random()
             
             return {
@@ -868,13 +1186,19 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                 water_sat = simulation.water_saturation or 0.3
                 init_press = simulation.initial_pressure or 3000
             
+            # Normalize porosity/water units: handle percent inputs (>1) by converting to fraction
+            if poros > 1.0:
+                poros = poros / 100.0
+            if water_sat > 1.0:
+                water_sat = water_sat / 100.0
+
             # Normalize parameters to scaling factors
             perm_scale = np.clip(0.7 + (perm / 500.0) * 0.6, 0.5, 1.5)
             poros_scale = np.clip(0.7 + (poros / 0.3) * 0.6, 0.5, 1.5)
             water_scale = np.clip(0.5 + (water_sat * 1.5), 0.5, 2.0)
-            oil_scale = 2.0 - water_scale
+            oil_scale = max(0.1, 2.0 - water_scale)
             press_scale = np.clip(0.8 + (init_press / 4000.0) * 0.4, 0.8, 1.2)
-            production_scale = perm_scale * poros_scale
+            production_scale = np.clip(perm_scale * poros_scale, 0.3, 3.0)
             
             # Apply parameter-based scaling with noise for ensemble diversity
             obs_oil = np.array(observed_data['oil'], dtype=float)[:N]
@@ -882,9 +1206,9 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             obs_gas = np.array(observed_data['gas'], dtype=float)[:N]
             obs_pressure = np.array(observed_data['pressure'], dtype=float)[:N]
             
-            oil_array = obs_oil * oil_scale * production_scale * (0.8 + np.random.random() * 0.4)
-            water_array = obs_water * water_scale * production_scale * (0.7 + np.random.random() * 0.6)
-            gas_array = obs_gas * production_scale * perm_scale * (0.75 + np.random.random() * 0.5)
+            oil_array = obs_oil * oil_scale * production_scale * (0.9 + np.random.random() * 0.2)
+            water_array = obs_water * water_scale * production_scale * (0.9 + np.random.random() * 0.2)
+            gas_array = obs_gas * production_scale * perm_scale * (0.9 + np.random.random() * 0.2)
             pressure_array = obs_pressure * press_scale + (21 - 5) * np.random.random()
             
             return {
@@ -1101,17 +1425,23 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                 poros_scale = 0.7 + (poros / 0.3) * 0.6  # Clamp to ~0.5-1.3
                 poros_scale = np.clip(poros_scale, 0.5, 1.5)
                 
+                # Normalize porosity/water units: handle percent inputs (>1) by converting to fraction
+                if poros > 1.0:
+                    poros = poros / 100.0
+                if water_sat > 1.0:
+                    water_sat = water_sat / 100.0
+
                 # Higher water saturation → more water, less oil
                 water_scale = 0.5 + (water_sat * 1.5)  # 0.5 to 2.0
                 water_scale = np.clip(water_scale, 0.5, 2.0)
-                oil_scale = 2.0 - water_scale  # Inverse relationship
+                oil_scale = max(0.1, 2.0 - water_scale)  # Avoid zero/negative oil scale
                 
                 # Higher pressure → pressure stays higher longer
                 press_scale = 0.8 + (init_press / 4000.0) * 0.4  # Clamp to ~0.8-1.2
                 press_scale = np.clip(press_scale, 0.8, 1.2)
                 
                 # Combined scaling effect
-                production_scale = perm_scale * poros_scale
+                production_scale = np.clip(perm_scale * poros_scale, 0.3, 3.0)
                 
                 # Use observed data as template and scale it
                 obs_oil = np.array(observed_data['oil'], dtype=float)[:N]
@@ -1120,9 +1450,10 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                 obs_pressure = np.array(observed_data['pressure'], dtype=float)[:N]
                 
                 # Apply parameter-based scaling
-                oil_array = obs_oil * oil_scale * production_scale * (0.8 + np.random.random() * 0.4)
-                water_array = obs_water * water_scale * production_scale * (0.7 + np.random.random() * 0.6)
-                gas_array = obs_gas * production_scale * perm_scale * (0.75 + np.random.random() * 0.5)
+                # Reduce random jitter amplitude to keep ensemble runs near observed scale
+                oil_array = obs_oil * oil_scale * production_scale * (0.9 + np.random.random() * 0.2)
+                water_array = obs_water * water_scale * production_scale * (0.9 + np.random.random() * 0.2)
+                gas_array = obs_gas * production_scale * perm_scale * (0.9 + np.random.random() * 0.2)
                 pressure_array = obs_pressure * press_scale + (21 - 5) * np.random.random()
                 
                 # Ensure non-negative
@@ -1184,11 +1515,36 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                 print(f"[WebSocket] Error broadcasting start: {ws_error}", file=sys.stderr, flush=True)
             
             print(f"[EnKF] Starting EnKF with {num_iterations} iterations", file=sys.stderr, flush=True)
+            # Determine measurement weights: prefer explicit request override, otherwise
+            # if a reservoir model was uploaded, prioritize pressure and oil to improve physical match.
+            req_weights = request.data.get('measurement_weights')
+            if req_weights:
+                try:
+                    measurement_weights = {k: float(v) for k, v in req_weights.items()}
+                except Exception:
+                    measurement_weights = None
+            else:
+                measurement_weights = None
+            # If dataset contains a parsed reservoir model, bias weights towards pressure and oil
+            try:
+                if measurement_weights is None and simulation.dataset and isinstance(simulation.dataset.production_data, dict):
+                    if 'reservoir_model' in simulation.dataset.production_data:
+                        measurement_weights = {
+                            'oil': 0.40,
+                            'pressure': 0.35,
+                            'water': 0.15,
+                            'gas': 0.10,
+                        }
+                        print(f"[EnKF] Using measurement_weights inferred from reservoir_model: {measurement_weights}", file=sys.stderr, flush=True)
+            except Exception:
+                pass
+
             try:
                 enkf_result = enkf.run_enkf(
                     observed_data=observed_data,
                     forward_model_fn=forward_model_fn,
                     initial_ensemble=prior_ensemble,
+                    measurement_weights=measurement_weights,
                     num_iterations=num_iterations,
                     progress_callback=progress_cb
                 )
@@ -1237,18 +1593,47 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             
             # Generate PRIOR forecast (before EnKF)
             fg = ForecastGenerator()
+            # Ensure ensemble members are dictionaries (consistent param names)
+            def _array_to_param_dict(arr):
+                try:
+                    # EnKFFilter._array_to_params uses order: [initial_pressure, porosity, permeability, water_saturation]
+                    return {
+                        'initial_pressure': float(arr[0]),
+                        'porosity': float(arr[1]),
+                        'permeability': float(arr[2]),
+                        'water_saturation': float(arr[3])
+                    }
+                except Exception:
+                    # Fallback if arr is already dict-like
+                    if isinstance(arr, dict):
+                        return arr
+                    return {
+                        'initial_pressure': float(arr[0]) if len(arr) > 0 else simulation.initial_pressure or 1500,
+                        'porosity': float(arr[1]) if len(arr) > 1 else simulation.porosity or 0.2,
+                        'permeability': float(arr[2]) if len(arr) > 2 else simulation.permeability or 100,
+                        'water_saturation': float(arr[3]) if len(arr) > 3 else simulation.water_saturation or 0.3
+                    }
+
+            prior_ensemble_list = []
+            for member in prior_ensemble.tolist():
+                prior_ensemble_list.append(_array_to_param_dict(member))
+
             prior_result = fg.generate_forecast(
                 str(simulation.id) + '_prior',
-                prior_ensemble.tolist(),
+                prior_ensemble_list,
                 forward_model_fn,
                 'prior',
                 forecast_period_days
             )
             
             # Generate POSTERIOR forecast (after EnKF)
+            posterior_ensemble_list_dicts = []
+            for member in posterior_ensemble_list:
+                posterior_ensemble_list_dicts.append(_array_to_param_dict(member))
+
             posterior_result = fg.generate_forecast(
                 str(simulation.id) + '_posterior',
-                posterior_ensemble_list,
+                posterior_ensemble_list_dicts,
                 forward_model_fn,
                 'posterior',
                 forecast_period_days
@@ -1325,6 +1710,29 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                 else:
                     return obj
             
+            # Extract predicted production values from posterior forecast for interpretation engine
+            # The interpretation engine expects: oil_predicted, water_predicted, gas_predicted, pressure_predicted
+            oil_predicted = 0.0
+            water_predicted = 0.0
+            gas_predicted = 0.0
+            pressure_predicted = float(simulation.initial_pressure or 1500)
+            
+            if posterior_result.get('status') == 'completed' and posterior_result.get('forecast'):
+                predictions = posterior_result['forecast'].get('predictions', {})
+                # Extract first mean value (current production estimate) from each metric
+                if 'oil' in predictions and isinstance(predictions['oil'], dict):
+                    mean_values = predictions['oil'].get('mean', [])
+                    oil_predicted = float(mean_values[0]) if mean_values else 50000.0
+                if 'water' in predictions and isinstance(predictions['water'], dict):
+                    mean_values = predictions['water'].get('mean', [])
+                    water_predicted = float(mean_values[0]) if mean_values else 20000.0
+                if 'gas' in predictions and isinstance(predictions['gas'], dict):
+                    mean_values = predictions['gas'].get('mean', [])
+                    gas_predicted = float(mean_values[0]) if mean_values else 500000.0
+                if 'pressure' in predictions and isinstance(predictions['pressure'], dict):
+                    mean_values = predictions['pressure'].get('mean', [])
+                    pressure_predicted = float(mean_values[0]) if mean_values else float(simulation.initial_pressure or 1500)
+            
             simulation.status = 'completed'
             simulation.match_quality = float(enkf_result.get('best_quality', 0))
             simulation.progress = 100
@@ -1332,6 +1740,11 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                 'enkf_result': convert_to_serializable({k: v for k, v in enkf_result.items() if k != 'final_ensemble'}),
                 'prior_ensemble': convert_to_serializable(prior_ensemble),
                 'posterior_ensemble': convert_to_serializable(posterior_ensemble_list),
+                # Add predicted production for interpretation engine
+                'oil_predicted': oil_predicted,
+                'water_predicted': water_predicted,
+                'gas_predicted': gas_predicted,
+                'pressure_predicted': pressure_predicted,
             }
             simulation.completed_at = timezone.now()
             if simulation.started_at:
@@ -1402,6 +1815,59 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
         simulations = request.user.simulation_runs.filter(matching_type=matching_type)
         serializer = SimulationRunListSerializer(simulations, many=True)
         return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def interpret(self, request, pk=None):
+        """
+        Generate comprehensive interpretation of simulation results
+        Provides expert-level analysis for reservoir engineers
+        """
+        simulation = self.get_object()
+        
+        # Ensure simulation is completed
+        if simulation.status != 'completed':
+            return Response({
+                'error': 'Can only interpret completed simulations'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if not simulation.results_data:
+            return Response({
+                'error': 'Simulation has no results to interpret'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            # Prepare simulation data for interpretation
+            simulation_data = {
+                'results_data': simulation.results_data,
+                'initial_pressure': simulation.initial_pressure,
+                'porosity': simulation.porosity,
+                'permeability': simulation.permeability,
+                'water_saturation': simulation.water_saturation,
+                'match_quality': simulation.match_quality or 0,
+                'matching_type': simulation.matching_type
+            }
+            
+            # Generate interpretation
+            interpretation = interpret_simulation_results(simulation_data)
+            
+            # Log activity
+            UserActivityLog.objects.create(
+                user=request.user,
+                activity_type='simulation_interpreted',
+                description=f"Generated interpretation for simulation: {simulation.name}"
+            )
+            
+            return Response({
+                'message': 'Simulation interpretation generated',
+                'interpretation': interpretation,
+                'simulation_id': simulation.id
+            }, status=status.HTTP_200_OK)
+        
+        except Exception as e:
+            logger.error(f"Interpretation error for simulation {pk}: {str(e)}")
+            return Response({
+                'error': f'Failed to generate interpretation: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class ForecastViewSet(viewsets.ModelViewSet):

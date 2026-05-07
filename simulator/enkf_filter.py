@@ -13,18 +13,28 @@ logger = logging.getLogger(__name__)
 
 
 class EnKFFilter:
-    """Implements Ensemble Kalman Filter for parameter estimation"""
-    
-    def __init__(self, ensemble_size: int = 50):
+    """Implements Ensemble Kalman Filter for parameter estimation
+
+    Enhancements:
+    - Supports measurement weighting (oil/water/gas/pressure)
+    - Applies a simple multiplicative inflation after each update
+    - (Hook for localization can be added later)
+    """
+
+    def __init__(self, ensemble_size: int = 50, inflation: float = 1.05, measurement_weights: Optional[Dict] = None):
         """
         Initialize EnKF Filter
-        
+
         Args:
             ensemble_size: Number of ensemble members
+            inflation: Multiplicative inflation factor applied to ensemble anomalies after update
+            measurement_weights: Optional dict of weights for observation types (e.g. {'oil':0.5,'water':0.2,...})
         """
         self.ensemble_size = ensemble_size
         self.ensemble_history = []
         self.parameter_history = []
+        self.inflation = float(inflation)
+        self.measurement_weights = measurement_weights or None
     
     def run_enkf(
         self,
@@ -32,6 +42,7 @@ class EnKFFilter:
         forward_model_fn: Callable,
         initial_ensemble: np.ndarray,
         measurement_error: Optional[Dict] = None,
+        measurement_weights: Optional[Dict] = None,
         num_iterations: int = 10,
         progress_callback: Optional[Callable] = None
     ) -> Dict:
@@ -57,9 +68,13 @@ class EnKFFilter:
         observations = self._extract_observations(observed_data)
         
         if measurement_error is None:
-            # Default: 5% measurement error
-            measurement_error = {k: np.max(v) * 0.05 
+            # Default: use tighter 2% measurement error but ensure a small floor
+            measurement_error = {k: max(np.max(v) * 0.02, 1e-3) 
                                 for k, v in observations.items()}
+
+        # Use measurement weights passed to run or default from the filter
+        if measurement_weights is not None:
+            self.measurement_weights = measurement_weights
         
         best_quality = 0.0
         best_params = None
@@ -154,8 +169,31 @@ class EnKFFilter:
         # Build simulated observation matrix (H x N)
         H_matrix = []
         for sim_dict in simulated_data:
-            sim_vec = np.concatenate([sim_dict.get(k, np.zeros(len(observations[k]))) 
-                                     for k in observations.keys()])
+            sim_components = []
+            for k in observations.keys():
+                obs_arr = observations[k]
+                # get simulated array or zeros if missing
+                sim_arr = np.array(sim_dict.get(k, np.zeros(len(obs_arr))), dtype=float)
+                # If lengths differ, resample/interpolate simulated to match observed length
+                if len(sim_arr) != len(obs_arr) and len(sim_arr) > 0 and len(obs_arr) > 0:
+                    try:
+                        sim_arr = np.interp(
+                            np.linspace(0, 1, len(obs_arr)),
+                            np.linspace(0, 1, len(sim_arr)),
+                            sim_arr
+                        )
+                    except Exception:
+                        # fallback to truncation or padding
+                        if len(sim_arr) > len(obs_arr):
+                            sim_arr = sim_arr[:len(obs_arr)]
+                        else:
+                            pad = np.zeros(len(obs_arr) - len(sim_arr))
+                            sim_arr = np.concatenate([sim_arr, pad])
+                # ensure correct length
+                if len(sim_arr) != len(obs_arr):
+                    sim_arr = np.resize(sim_arr, len(obs_arr))
+                sim_components.append(sim_arr)
+            sim_vec = np.concatenate(sim_components)
             H_matrix.append(sim_vec)
         H_matrix = np.array(H_matrix).T  # H x N
         
@@ -187,7 +225,33 @@ class EnKFFilter:
                 # Innovation: real observations - simulated for this member
                 innovation = obs_vec - H_matrix[:, i]
                 updated_ensemble[i, :] += K_gain @ innovation
-            
+            # Apply simple multiplicative inflation to maintain ensemble spread
+            try:
+                # Basic sanity clamps per-parameter to avoid extreme/unphysical values
+                # Parameter order: ['initial_pressure', 'porosity', 'permeability', 'water_saturation']
+                # Apply Kalman update first, then inflation, then clamp
+                mean_vec = np.mean(updated_ensemble, axis=0, keepdims=True)
+                anomalies = updated_ensemble - mean_vec
+                updated_ensemble = mean_vec + self.inflation * anomalies
+
+                # Clamp physically meaningful bounds to avoid collapse to zeros or NaNs
+                # initial_pressure: [100, 10000]
+                updated_ensemble[:, 0] = np.clip(updated_ensemble[:, 0], 100.0, 10000.0)
+                # porosity: expect fraction (0.01 - 0.5) but allow percent-style values up to 50
+                updated_ensemble[:, 1] = np.where(updated_ensemble[:, 1] > 5.0,
+                                                  np.clip(updated_ensemble[:, 1] / 100.0, 0.01, 0.5),
+                                                  np.clip(updated_ensemble[:, 1], 0.01, 0.5))
+                # permeability: [0.1, 1e6]
+                updated_ensemble[:, 2] = np.clip(updated_ensemble[:, 2], 0.1, 1e6)
+                # water_saturation: expect fraction (0-1) possibly expressed as percent
+                updated_ensemble[:, 3] = np.where(updated_ensemble[:, 3] > 5.0,
+                                                  np.clip(updated_ensemble[:, 3] / 100.0, 0.0, 1.0),
+                                                  np.clip(updated_ensemble[:, 3], 0.0, 1.0))
+
+            except Exception:
+                # If anything goes wrong with inflation/clamping, return uninflated ensemble
+                logger.warning("Inflation/clamping step failed; returning uninflated ensemble")
+
             return updated_ensemble
             
         except np.linalg.LinAlgError as e:
@@ -210,25 +274,36 @@ class EnKFFilter:
         try:
             errors = []
             
-            for key in observed:
-                if key not in simulated:
-                    continue
-                
+            # Determine weights: prefer filter-level weights if set, otherwise equal weights
+            keys = [k for k in observed.keys() if k in simulated]
+            if not keys:
+                return 0.0
+
+            if self.measurement_weights:
+                weights = {k: float(self.measurement_weights.get(k, 1.0)) for k in keys}
+            else:
+                weights = {k: 1.0 for k in keys}
+
+            # Normalize weights
+            total_w = sum(weights.values()) if sum(weights.values()) > 0 else len(weights)
+
+            weighted_score = 0.0
+            for key in keys:
                 obs = np.array(observed[key])
                 sim = np.array(simulated[key])
-                
+
                 # Interpolate if lengths differ
                 if len(obs) != len(sim):
                     sim = np.interp(np.linspace(0, 1, len(obs)),
                                    np.linspace(0, 1, len(sim)), sim)
-                
+
                 # Normalized RMSE
                 rmse = np.sqrt(np.mean((obs - sim) ** 2))
                 nrmse = rmse / (np.max(obs) - np.min(obs)) if np.ptp(obs) > 0 else 1.0
-                error = max(0, 100 * (1 - nrmse))
-                errors.append(error)
-            
-            return float(np.mean(errors)) if errors else 0.0
+                score = max(0, 100 * (1 - nrmse))
+                weighted_score += score * (weights[key] / total_w)
+
+            return float(weighted_score)
             
         except Exception as e:
             logger.error(f"Error calculating quality: {e}")

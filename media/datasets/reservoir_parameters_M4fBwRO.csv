@@ -1,0 +1,15 @@
+parameter_name,min_value,base_value,max_value,unit,description
+initial_pressure,180,250,320,bar,Initial reservoir pressure
+porosity,0.08,0.15,0.25,fraction,Rock pore space fraction
+permeability,10,100,500,mD,Rock permeability
+water_saturation,0.2,0.3,0.5,fraction,Initial water saturation
+oil_viscosity,1.5,2.5,4.5,cp,Oil dynamic viscosity
+rock_compressibility,3e-5,5e-5,1e-4,1/bar,Rock compaction coefficient
+relative_perm_endpoint,0.7,0.85,0.95,fraction,Relative permeability endpoint
+capillary_pressure_entry,0.5,1.5,3.0,bar,Capillary pressure at wetting phase
+well_productivity_index,0.5,1.0,2.0,bbl/day/psi,Well flow capacity
+depth,2800,3200,3600,m,Reservoir depth
+temperature,85,95,105,degC,Reservoir temperature
+thickness,25,50,100,m,Reservoir thickness
+area,5000,12500,25000,hectares,Reservoir area
+oil_initial_sat,0.5,0.7,0.8,fraction,Initial oil saturation
