@@ -1,66 +1,55 @@
-from rest_framework import viewsets, status, permissions
-from rest_framework.views import APIView
-from rest_framework.parsers import FormParser, MultiPartParser
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from rest_framework.authtoken.models import Token
-from django.contrib.auth import authenticate, get_user_model
-from django.db.models import Q
-from django.utils import timezone
+from typing import Any, cast
 from datetime import timedelta
 import logging
-import numpy as np
-import time
 import threading
+import time
 import sys
 
-# WebSocket utilities
+import numpy as np
 from asgiref.sync import async_to_sync
-from api.ws_utils import broadcast_simulation_progress, broadcast_simulation_complete, broadcast_simulation_error
-
-from users.models import CustomUser, UserActivityLog
-from simulations.models import Dataset, SimulationRun, Forecast, SimulationStatistics
-from api.serializers import (
-    UserRegistrationSerializer, UserSerializer, UserDetailSerializer,
-    DatasetSerializer, SimulationRunCreateSerializer, SimulationRunDetailSerializer,
-    SimulationRunListSerializer, ForecastSerializer, DashboardSummarySerializer,
-    UserActivityLogSerializer
-)
-
-from simulator.forecast_generator import ForecastGenerator
-from simulator.enkf_filter import EnKFFilter
-from simulator.engine import SimulationEngine
-from simulator.interpretation import interpret_simulation_results
-
-User = get_user_model()
-from rest_framework.response import Response
-from rest_framework.authtoken.models import Token
 from django.contrib.auth import authenticate, get_user_model
 from django.db.models import Q
 from django.utils import timezone
-from datetime import timedelta
-import logging
-import numpy as np
-import time
-import threading
-import sys
+from rest_framework import viewsets, status, permissions
+from rest_framework.authtoken.models import Token
+from rest_framework.decorators import action
+from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
-from users.models import CustomUser, UserActivityLog
-from simulations.models import Dataset, SimulationRun, Forecast, SimulationStatistics
 from api.serializers import (
-    UserRegistrationSerializer, UserSerializer, UserDetailSerializer,
-    DatasetSerializer, SimulationRunCreateSerializer, SimulationRunDetailSerializer,
-    SimulationRunListSerializer, ForecastSerializer, DashboardSummarySerializer,
-    UserActivityLogSerializer
+    DashboardSummarySerializer,
+    DatasetSerializer,
+    ForecastSerializer,
+    SimulationRunCreateSerializer,
+    SimulationRunDetailSerializer,
+    SimulationRunListSerializer,
+    UserActivityLogSerializer,
+    UserDetailSerializer,
+    UserRegistrationSerializer,
+    UserSerializer,
 )
-
-from simulator.forecast_generator import ForecastGenerator
-from simulator.enkf_filter import EnKFFilter
+from django.conf import settings
+from api.ws_utils import broadcast_simulation_complete, broadcast_simulation_error, broadcast_simulation_progress
 from simulator.engine import SimulationEngine
+from simulator.enkf_filter import EnKFFilter
+from simulator.forecast_generator import ForecastGenerator
+from simulator.interpretation import interpret_simulation_results
+from simulations.models import Dataset, Forecast, SimulationRun, SimulationStatistics
+from users.models import CustomUser, UserActivityLog
 
 User = get_user_model()
 
 logger = logging.getLogger(__name__)
+
+
+def safe_float(value: Any, fallback: float) -> float:
+    if value is None:
+        return fallback
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def run_baseline_simulation(simulation_id: int):
@@ -327,7 +316,8 @@ class UserViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         """Users can only view their own profile"""
-        return User.objects.filter(id=self.request.user.id)
+        user = cast(CustomUser, self.request.user)
+        return User.objects.filter(pk=user.pk)
     
     @action(detail=False, methods=['get'])
     def me(self, request):
@@ -476,7 +466,7 @@ class SensitivitySimulationView(APIView):
 
         serializer = SensitivityRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        payload = serializer.validated_data
+        payload = cast(dict[str, Any], serializer.validated_data)
 
         # Minimal internal runner: compute combinations count and return full scenario profiles
         gas_min = payload['gas_injection_min_mmscfpd']
@@ -832,6 +822,38 @@ class DatasetViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(datasets, many=True)
         return Response(serializer.data)
 
+    @action(detail=True, methods=['patch'])
+    def attach_model(self, request, pk=None):
+        """Attach a reservoir_model JSON blob to an existing dataset.
+
+        Body: { "reservoir_model": { ... } }
+        """
+        try:
+            dataset = self.get_object()
+        except Dataset.DoesNotExist:
+            return Response({'detail': 'Dataset not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        model_json = request.data.get('reservoir_model')
+        # accept raw JSON body as well
+        if model_json is None and request.body:
+            try:
+                import json
+                model_json = json.loads(request.body.decode('utf-8'))
+            except Exception:
+                model_json = None
+
+        if not model_json:
+            return Response({'detail': 'reservoir_model JSON required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Merge into existing production_data dict preserving any production arrays
+        prod = getattr(dataset, 'production_data', {}) or {}
+        prod['reservoir_model'] = model_json
+        dataset.production_data = prod
+        dataset.save(update_fields=['production_data'])
+
+        serializer = self.get_serializer(dataset)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
 
 class SimulationRunViewSet(viewsets.ModelViewSet):
     """Manage simulation runs"""
@@ -868,6 +890,19 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             return Response({
                 'error': 'Cannot start a completed or failed simulation'
             }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Enforce reservoir model presence if configured
+        try:
+            require_model = bool(getattr(settings, 'REQUIRE_RESERVOIR_MODEL', False))
+        except Exception:
+            require_model = False
+
+        if require_model:
+            if not simulation.dataset:
+                return Response({'detail': 'Simulation requires a dataset with attached reservoir_model.'}, status=status.HTTP_400_BAD_REQUEST)
+            prod = getattr(simulation.dataset, 'production_data', {}) or {}
+            if 'reservoir_model' not in prod:
+                return Response({'detail': 'Reservoir model required. Attach a reservoir model to the dataset or create a combined dataset.'}, status=status.HTTP_400_BAD_REQUEST)
 
         simulation.status = 'running'
         simulation.started_at = timezone.now()
@@ -1024,10 +1059,10 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             
             # Handle both dict and array/list parameter formats
             if isinstance(params, dict):
-                perm = float(params.get('permeability', simulation.permeability or 100))
-                poros = float(params.get('porosity', simulation.porosity or 0.2))
-                water_sat = float(params.get('water_saturation', simulation.water_saturation or 0.3))
-                init_press = float(params.get('initial_pressure', simulation.initial_pressure or 3000))
+                perm = safe_float(params.get('permeability'), simulation.permeability or 100)
+                poros = safe_float(params.get('porosity'), simulation.porosity or 0.2)
+                water_sat = safe_float(params.get('water_saturation'), simulation.water_saturation or 0.3)
+                init_press = safe_float(params.get('initial_pressure'), simulation.initial_pressure or 3000)
             elif isinstance(params, (list, np.ndarray)):
                 try:
                     # From EnKF _array_to_params: [initial_pressure, porosity, permeability, water_saturation]
@@ -1165,10 +1200,10 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             
             # Handle both dict and array/list parameter formats
             if isinstance(params, dict):
-                perm = float(params.get('permeability', simulation.permeability or 100))
-                poros = float(params.get('porosity', simulation.porosity or 0.2))
-                water_sat = float(params.get('water_saturation', simulation.water_saturation or 0.3))
-                init_press = float(params.get('initial_pressure', simulation.initial_pressure or 3000))
+                perm = safe_float(params.get('permeability'), simulation.permeability or 100)
+                poros = safe_float(params.get('porosity'), simulation.porosity or 0.2)
+                water_sat = safe_float(params.get('water_saturation'), simulation.water_saturation or 0.3)
+                init_press = safe_float(params.get('initial_pressure'), simulation.initial_pressure or 3000)
             elif isinstance(params, (list, np.ndarray)):
                 try:
                     perm = float(params[0]) if len(params) > 0 else (simulation.permeability or 100)
@@ -1391,10 +1426,10 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                 # Handle both dict and array/list parameter formats
                 if isinstance(params, dict):
                     # From EnKF - dictionary format
-                    perm = float(params.get('permeability', simulation.permeability or 100))
-                    poros = float(params.get('porosity', simulation.porosity or 0.2))
-                    water_sat = float(params.get('water_saturation', simulation.water_saturation or 0.3))
-                    init_press = float(params.get('initial_pressure', simulation.initial_pressure or 3000))
+                    perm = safe_float(params.get('permeability'), simulation.permeability or 100)
+                    poros = safe_float(params.get('porosity'), simulation.porosity or 0.2)
+                    water_sat = safe_float(params.get('water_saturation'), simulation.water_saturation or 0.3)
+                    init_press = safe_float(params.get('initial_pressure'), simulation.initial_pressure or 3000)
                 elif isinstance(params, (list, np.ndarray)):
                     # From forecast generator - array/list format
                     # Order: [permeability, porosity, water_saturation, initial_pressure]
@@ -1930,7 +1965,8 @@ class ForecastViewSet(viewsets.ModelViewSet):
                             status=status.HTTP_400_BAD_REQUEST)
 
         # Try to collect parameter values from forecasts' predicted_parameters
-        forecasts = self.request.user.forecasts.filter(simulation_id=simulation_id)
+        user = cast(CustomUser, self.request.user)
+        forecasts = user.forecasts.filter(simulation_id=simulation_id)
         values = []
         for f in forecasts:
             params = f.predicted_parameters or {}
@@ -1963,8 +1999,9 @@ class ForecastViewSet(viewsets.ModelViewSet):
             return Response({'error': 'simulation_id required'}, status=status.HTTP_400_BAD_REQUEST)
 
         # Find latest prior and posterior forecasts
-        prior = self.request.user.forecasts.filter(simulation_id=simulation_id, forecast_type='prior').order_by('-generated_at').first()
-        posterior = self.request.user.forecasts.filter(simulation_id=simulation_id, forecast_type='posterior').order_by('-generated_at').first()
+        user = cast(CustomUser, self.request.user)
+        prior = user.forecasts.filter(simulation_id=simulation_id, forecast_type='prior').order_by('-generated_at').first()
+        posterior = user.forecasts.filter(simulation_id=simulation_id, forecast_type='posterior').order_by('-generated_at').first()
 
         if not prior or not posterior:
             return Response({'error': 'Both prior and posterior forecasts required'}, status=status.HTTP_404_NOT_FOUND)

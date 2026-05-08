@@ -189,6 +189,10 @@ REST_FRAMEWORK = {
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
+# Require reservoir model to be attached to datasets before running simulations.
+# This can be toggled by ops for backward compatibility/migration.
+REQUIRE_RESERVOIR_MODEL = True
+
 # Security settings
 SECURE_BROWSER_XSS_FILTER = True
 SECURE_CONTENT_SECURITY_POLICY = {

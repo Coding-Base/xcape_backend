@@ -171,7 +171,7 @@ class DatasetSerializer(serializers.ModelSerializer):
                 **validated_data
             )
         
-        print(f"[DATASET CREATE] SUCCESS - dataset id={dataset.id}", file=sys.stderr, flush=True)
+        print(f"[DATASET CREATE] SUCCESS - dataset pk={dataset.pk}", file=sys.stderr, flush=True)
         return dataset
 
 
